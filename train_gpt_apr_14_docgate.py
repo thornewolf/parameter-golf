@@ -941,10 +941,13 @@ def main() -> None:
         enable_mem_efficient_sdp,
     )
 
-    enable_cudnn_sdp(False)
+    # Flash SDPA does not accept a custom attn_mask, so when the doc-attention
+    # gate is on we also enable cuDNN / mem-efficient / math backends as fallbacks.
+    # Flash stays on for the gate-off path and other unmasked calls.
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_cudnn_sdp(args.doc_attn_gate)
+    enable_mem_efficient_sdp(args.doc_attn_gate)
+    enable_math_sdp(args.doc_attn_gate)
 
     logfile = None
     if master_process:
