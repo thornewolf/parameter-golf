@@ -26,7 +26,40 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+def build_doc_block_mask(
+    is_boundary_token_lut: Tensor,
+    input_ids: Tensor,
+    enabled: bool,
+) -> BlockMask | None:
+    # Builds a (causal ∧ same-document) BlockMask for FlexAttention. Returns
+    # None if the gate is off; callers then use the SDPA causal fast path.
+    if not enabled:
+        return None
+    is_start = is_boundary_token_lut[input_ids]
+    doc_id = is_start.to(torch.int32).cumsum(dim=1)
+    batch_size, seqlen = doc_id.shape
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        del h
+        return (q_idx >= kv_idx) & (doc_id[b, q_idx] == doc_id[b, kv_idx])
+
+    return create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=None,
+        Q_LEN=seqlen,
+        KV_LEN=seqlen,
+        device=input_ids.device,
+        _compile=True,
+    )
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -309,8 +342,11 @@ def eval_val(
             )
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
+            block_mask = build_doc_block_mask(
+                is_boundary_token_lut, x, args.doc_attn_gate
+            )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, block_mask).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -685,7 +721,7 @@ class CausalSelfAttention(nn.Module):
         )
         self.rotary = Rotary(args)
 
-    def forward(self, x: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, block_mask: BlockMask | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = (
             self.c_q(x)
@@ -708,7 +744,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if attn_mask is None:
+        if block_mask is None:
             y = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -718,14 +754,13 @@ class CausalSelfAttention(nn.Module):
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
-            # attn_mask already folds in the causal triangle; SDPA forbids combining
-            # attn_mask with is_causal=True.
-            y = F.scaled_dot_product_attention(
+            # FlexAttention consumes the BlockMask (causal ∧ same-doc) directly and
+            # retains flash-style performance even with the custom mask.
+            y = flex_attention(
                 q,
                 k,
                 v,
-                attn_mask=attn_mask,
-                is_causal=False,
+                block_mask=block_mask,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -761,10 +796,12 @@ class Block(nn.Module):
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
 
-    def forward(self, x: Tensor, x0: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self, x: Tensor, x0: Tensor, block_mask: BlockMask | None = None
+    ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), attn_mask)
+        attn_out = self.attn(self.attn_norm(x), block_mask)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
             self.mlp_norm(x)
@@ -800,24 +837,6 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
-    def _build_doc_attn_mask(self, input_ids: Tensor) -> Tensor | None:
-        # Block-diagonal mask (folded with causal): token i attends to j iff
-        # j <= i and doc_id[b, i] == doc_id[b, j]. Returns (B, 1, S, S) bool,
-        # or None if the gate is off / the boundary LUT has not been installed.
-        if not getattr(self, "doc_attn_gate", False):
-            return None
-        lut = getattr(self, "is_boundary_token_lut", None)
-        if lut is None:
-            return None
-        is_start = lut[input_ids]
-        doc_id = is_start.to(torch.int32).cumsum(dim=1)
-        same_doc = doc_id[:, :, None] == doc_id[:, None, :]
-        seqlen = input_ids.size(1)
-        causal = torch.ones(
-            seqlen, seqlen, dtype=torch.bool, device=input_ids.device
-        ).tril()
-        return (same_doc & causal).unsqueeze(1)
-
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -825,8 +844,12 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        attn_mask = self._build_doc_attn_mask(input_ids)
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        block_mask: BlockMask | None = None,
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -834,7 +857,7 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, attn_mask)
+            x = self.blocks[i](x, x0, block_mask)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
@@ -843,7 +866,7 @@ class GPT(nn.Module):
                     + self.skip_weights[i].to(dtype=x.dtype)[None, None, :]
                     * skips.pop()
                 )
-            x = self.blocks[self.num_encoder_layers + i](x, x0, attn_mask)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, block_mask)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -941,13 +964,10 @@ def main() -> None:
         enable_mem_efficient_sdp,
     )
 
-    # Flash SDPA does not accept a custom attn_mask, so when the doc-attention
-    # gate is on we also enable cuDNN / mem-efficient / math backends as fallbacks.
-    # Flash stays on for the gate-off path and other unmasked calls.
+    enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_cudnn_sdp(args.doc_attn_gate)
-    enable_mem_efficient_sdp(args.doc_attn_gate)
-    enable_math_sdp(args.doc_attn_gate)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -1142,8 +1162,11 @@ def main() -> None:
             x, y = train_loader.next_batch(
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
+            block_mask = build_doc_block_mask(
+                is_boundary_token_lut, x, args.doc_attn_gate
+            )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, block_mask)
             total_loss += loss.detach()
             (loss * grad_scale).backward()
         return total_loss / grad_accum_steps
