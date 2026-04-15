@@ -555,22 +555,35 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 def load_data_shard(file: Path) -> Tensor:
+    # Overlay filesystems on RunPod occasionally return EPERM when all 8 ranks
+    # open the same shard simultaneously at a shard-boundary transition. The
+    # file itself is fine, so retry with backoff before giving up.
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(
-            f"Shard size mismatch for {file}: expected {expected_size} bytes"
-        )
-    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    if tokens_np.size != num_tokens:
-        raise ValueError(f"Short read for {file}")
-    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+    last_err: Exception | None = None
+    for attempt in range(8):
+        try:
+            header = np.fromfile(file, dtype="<i4", count=256)
+            if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+                raise ValueError(f"Unexpected shard header for {file}")
+            num_tokens = int(header[2])
+            expected_size = header_bytes + num_tokens * token_bytes
+            if file.stat().st_size != expected_size:
+                raise ValueError(
+                    f"Shard size mismatch for {file}: expected {expected_size} bytes"
+                )
+            tokens_np = np.fromfile(
+                file, dtype="<u2", count=num_tokens, offset=header_bytes
+            )
+            if tokens_np.size != num_tokens:
+                raise ValueError(f"Short read for {file}")
+            return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+        except (PermissionError, OSError) as e:
+            last_err = e
+            time.sleep(0.25 * (2**attempt))
+    raise RuntimeError(
+        f"Failed to load shard {file} after 8 retries; last error: {last_err}"
+    )
 
 
 class TokenStream:
