@@ -1,0 +1,15 @@
+{
+  "author": "thornewolf",
+  "github_id": "thornewolf",
+  "name": "Document-Boundary Attention Gate (FlexAttention)",
+  "blurb": "Non-record experiment forked from train_gpt_apr_14.py: restrict attention so each token only sees prior tokens within its own document in the packed sequence. Document IDs are derived per-batch from the SentencePiece boundary LUT (cumsum of is_boundary_token); a FlexAttention BlockMask folds causal and same-doc constraints into one kernel. Single-seed result beats the train_gpt_apr_14.py baseline by ~0.0028 nats val_loss (~0.0017 bpb) — positive but below the 0.005-nat record bar.",
+  "date": "2026-04-15T00:00:00Z",
+  "track": "non-record-16mb",
+  "baseline_script": "train_gpt_apr_14.py",
+  "baseline_val_loss": 2.07185845,
+  "baseline_val_bpb": 1.22707128,
+  "val_loss": 2.06904804,
+  "val_bpb": 1.22540679,
+  "delta_val_loss_nats": -0.00281041,
+  "delta_val_bpb": -0.00166449
+}
