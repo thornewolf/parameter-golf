@@ -1,0 +1,17 @@
+{
+  "author": "TODO",
+  "github_id": "TODO",
+  "name": "Refactor of train_gpt.py",
+  "blurb": "Refactor of baseline train_gpt.py with no ML changes; default hyperparameters match the Naive Baseline.",
+  "date": "2026-04-22",
+  "track": "10min_16mb",
+  "seeds": [42, 314, 999],
+  "seed_results": {
+    "42":  {"val_bpb": null, "artifact_bytes": null},
+    "314": {"val_bpb": null, "artifact_bytes": null},
+    "999": {"val_bpb": null, "artifact_bytes": null}
+  },
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "hardware": "8xH100 80GB SXM"
+}
