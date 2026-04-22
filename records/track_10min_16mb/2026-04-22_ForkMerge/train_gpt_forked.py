@@ -210,18 +210,23 @@ def linearized_loss_and_grad(
     functorch form is required (plain torch.autograd.grad with
     requires_grad_() is not allowed inside a jvp transform).
     """
-    # Cast theta1, delta, and floating buffers to bf16 *outside* the jvp
-    # transform. CastedLinear's `.to(x.dtype)` becomes a no-op, so we never
-    # cross dtypes inside a dual-tensor operation (which is where functorch
-    # trips up). We cast the resulting gradient back to the caller's
-    # original param dtypes so the optimizer sees the dtypes it expects.
+    # Run phase C fully in fp32. Mixed-precision (bf16 activations +
+    # fp32 CastedLinear weights) relies on `self.weight.to(x.dtype)`
+    # inside CastedLinear, which is a cast on a dual tensor — functorch
+    # handles dual-tensor .to(dtype) unreliably and we kept hitting
+    # matmul dtype mismatches. By putting *every* floating-point param
+    # and buffer in fp32 upfront, `.to(x.dtype)` is a no-op, no cross-
+    # dtype matmul can happen, and the jvp path stays clean. Memory cost
+    # is ~2× vs bf16 — mitigated by running phase C at the reduced
+    # TRAIN_BATCH_TOKENS / TRAIN_SEQ_LEN the README documents.
     orig_dtypes = {name: t.dtype for name, t in theta1.items()}
-    theta1_bf16 = {k: v.to(torch.bfloat16) for k, v in theta1.items()}
-    delta_bf16 = {
-        k: (theta2[k] - theta1[k]).to(torch.bfloat16) for k in theta1
+    phase_c_dtype = torch.float32
+    theta1_cast = {k: v.to(phase_c_dtype) for k, v in theta1.items()}
+    delta_cast = {
+        k: (theta2[k] - theta1[k]).to(phase_c_dtype) for k in theta1
     }
     buffers_cast = {
-        k: (b.to(torch.bfloat16) if b.is_floating_point() else b)
+        k: (b.to(phase_c_dtype) if b.is_floating_point() else b)
         for k, b in buffers.items()
     }
 
@@ -229,7 +234,7 @@ def linearized_loss_and_grad(
         return _loss_of_params(model, params, buffers_cast, x, y, block_mask)
 
     grad_of_loss = grad(loss_fn)
-    g1, Hdelta = jvp(grad_of_loss, (theta1_bf16,), (delta_bf16,))
+    g1, Hdelta = jvp(grad_of_loss, (theta1_cast,), (delta_cast,))
     out_grad = {
         name: (g1[name] + Hdelta[name]).to(orig_dtypes[name]) for name in g1
     }
@@ -237,11 +242,11 @@ def linearized_loss_and_grad(
     # Also compute the surrogate value itself for logging.
     with torch.no_grad():
         loss_at_theta1 = _loss_of_params(
-            model, theta1_bf16, buffers_cast, x, y, block_mask
+            model, theta1_cast, buffers_cast, x, y, block_mask
         )
-        linear_term = sum((g1[n] * delta_bf16[n]).sum() for n in g1)
+        linear_term = sum((g1[n] * delta_cast[n]).sum() for n in g1)
         quadratic_term = 0.5 * sum(
-            (Hdelta[n] * delta_bf16[n]).sum() for n in Hdelta
+            (Hdelta[n] * delta_cast[n]).sum() for n in Hdelta
         )
         surrogate_loss = loss_at_theta1 + linear_term + quadratic_term
 
