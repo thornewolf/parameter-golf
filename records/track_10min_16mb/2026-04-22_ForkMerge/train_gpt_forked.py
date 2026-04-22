@@ -40,6 +40,7 @@ Caveats, stated plainly:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import math
@@ -166,6 +167,33 @@ def broadcast_params_from_rank0(model: nn.Module) -> None:
 # -----------------------------
 
 
+@contextlib.contextmanager
+def _castedlinear_skip_dtype_cast():
+    """Temporarily replace CastedLinear.forward with one that skips .to(x.dtype).
+
+    CastedLinear normally casts its weight to the activation dtype at matmul
+    time so that mixed-precision (fp32 weights, bf16 activations) works under
+    autocast. Under functorch's jvp, that dual-tensor .to(dtype) is unreliable
+    — it was the specific line that kept producing bf16/fp32 matmul mismatches
+    and forced us into fully-fp32 phase C. With all params cast to a single
+    dtype upfront for phase C, the cast is redundant anyway, so we skip it
+    entirely for the duration of phase C. Cheaper-safer than fighting the
+    dual-tensor cast.
+    """
+    from train_gpt import CastedLinear  # local import to avoid cycles
+
+    original = CastedLinear.forward
+
+    def _no_cast_forward(self, x):  # noqa: N802 — matching nn.Module.forward
+        return F.linear(x, self.weight, self.bias)
+
+    CastedLinear.forward = _no_cast_forward
+    try:
+        yield
+    finally:
+        CastedLinear.forward = original
+
+
 def _loss_of_params(
     model: nn.Module,
     params: dict[str, Tensor],
@@ -216,17 +244,16 @@ def linearized_loss_and_grad(
     functorch form is required (plain torch.autograd.grad with
     requires_grad_() is not allowed inside a jvp transform).
     """
-    # Run phase C fully in fp32. Mixed-precision (bf16 activations +
-    # fp32 CastedLinear weights) relies on `self.weight.to(x.dtype)`
-    # inside CastedLinear, which is a cast on a dual tensor — functorch
-    # handles dual-tensor .to(dtype) unreliably and we kept hitting
-    # matmul dtype mismatches. By putting *every* floating-point param
-    # and buffer in fp32 upfront, `.to(x.dtype)` is a no-op, no cross-
-    # dtype matmul can happen, and the jvp path stays clean. Memory cost
-    # is ~2× vs bf16 — mitigated by running phase C at the reduced
-    # TRAIN_BATCH_TOKENS / TRAIN_SEQ_LEN the README documents.
+    # Run phase C in bf16 with CastedLinear's `.to(x.dtype)` monkey-patched
+    # out for the duration. Cast every floating param and buffer to bf16
+    # upfront so no cross-dtype matmul is possible, then use the
+    # _castedlinear_skip_dtype_cast context manager to prevent the dual-
+    # tensor cast inside CastedLinear.forward from firing. That cast was the
+    # load-bearing failure in earlier bf16 attempts — dropping it is safe
+    # here because all operands are already the same dtype. Net effect: ~2×
+    # phase-C throughput vs the previous fp32 path.
     orig_dtypes = {name: t.dtype for name, t in theta1.items()}
-    phase_c_dtype = torch.float32
+    phase_c_dtype = torch.bfloat16
     theta1_cast = {k: v.to(phase_c_dtype) for k, v in theta1.items()}
     delta_cast = {
         k: (theta2[k] - theta1[k]).to(phase_c_dtype) for k in theta1
@@ -239,17 +266,22 @@ def linearized_loss_and_grad(
     def loss_fn(params: dict[str, Tensor]) -> Tensor:
         return _loss_of_params(model, params, buffers_cast, x, y, block_mask)
 
-    grad_of_loss = grad(loss_fn)
-    g1, Hdelta = jvp(grad_of_loss, (theta1_cast,), (delta_cast,))
+    with _castedlinear_skip_dtype_cast():
+        grad_of_loss = grad(loss_fn)
+        g1, Hdelta = jvp(grad_of_loss, (theta1_cast,), (delta_cast,))
+
+        # Also compute the surrogate value itself for logging. Must stay
+        # inside the monkey-patch because the functional_call forward pass
+        # still goes through CastedLinear.
+        with torch.no_grad():
+            loss_at_theta1 = _loss_of_params(
+                model, theta1_cast, buffers_cast, x, y, block_mask
+            )
+
     out_grad = {
         name: (g1[name] + Hdelta[name]).to(orig_dtypes[name]) for name in g1
     }
-
-    # Also compute the surrogate value itself for logging.
     with torch.no_grad():
-        loss_at_theta1 = _loss_of_params(
-            model, theta1_cast, buffers_cast, x, y, block_mask
-        )
         linear_term = sum((g1[n] * delta_cast[n]).sum() for n in g1)
         quadratic_term = 0.5 * sum(
             (Hdelta[n] * delta_cast[n]).sum() for n in Hdelta
