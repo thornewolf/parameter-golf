@@ -92,6 +92,12 @@ class Hyperparameters(BaseHyperparameters):
     # Branch-2 uses plain Adam; keep LR conservative since linearized gradients
     # can be biased as θ₂ drifts from θ₁.
     fork_branch2_lr = float(os.environ.get("FORK_BRANCH2_LR", 0.01))
+    # Warmup: run this many plain training steps before the fork-merge
+    # machinery kicks in. Averaging-style tricks (SWA, EMA, ...) typically
+    # only help once the model is near a basin — averaging divergent
+    # trajectories early in training just muddles progress. 0 means
+    # fork-merge starts from step 0 (original behavior).
+    fork_warmup_steps = int(os.environ.get("FORK_WARMUP_STEPS", 0))
 
 
 # -----------------------------
@@ -555,12 +561,16 @@ def main() -> None:
                     f"surrogate_loss:{surrogate_loss.item():.4f} drift:{drift:.4f}"
                 )
 
-    # -------- Main loop: A, (B, C, D), A, (B, C, D), … --------
+    # -------- Main loop: (optional warmup of plain phase A) then A,(B,C,D),… --------
+    # While-loop form so the per-iter cost (N vs 3N) can depend on whether
+    # fork-merge is active, instead of assuming a fixed steps_per_cycle.
     N = args.fork_phase_steps
-    steps_per_cycle = 3 * N
-    num_cycles = max(args.iterations // steps_per_cycle, 1)
 
-    log(f"cycles:{num_cycles} steps_per_cycle:{steps_per_cycle}")
+    log(
+        f"iterations:{args.iterations} N:{N} "
+        f"fork_enabled:{args.fork_enabled} "
+        f"fork_warmup_steps:{args.fork_warmup_steps}"
+    )
 
     # Initial val
     val_loss, val_bpb = run_eval_val()
@@ -569,14 +579,24 @@ def main() -> None:
 
     t0 = time.perf_counter()
     global_step = 0
-    for cycle in range(num_cycles):
-        log(f"=== cycle {cycle + 1}/{num_cycles} ===")
+    cycle = 0
+    while global_step < args.iterations:
+        cycle += 1
+        # Fork-merge is "on" only if enabled AND we've finished warmup.
+        # During warmup each iteration of this loop does N plain A-steps;
+        # after warmup it does 3N (A + B + C, merge in D).
+        fork_active = (
+            args.fork_enabled and global_step >= args.fork_warmup_steps
+        )
+        log(
+            f"=== cycle {cycle} (step {global_step}, fork_active={fork_active}) ==="
+        )
 
         # Phase A: normal training on single model.
         run_phase_real(N, train_loader, optimizers, tag="phaseA")
         global_step += N
 
-        if not args.fork_enabled:
+        if not fork_active:
             val_loss, val_bpb = run_eval_val()
             log(f"step:{global_step} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
             continue
