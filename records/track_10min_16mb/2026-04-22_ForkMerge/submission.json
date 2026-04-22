@@ -1,0 +1,15 @@
+{
+  "author": "TODO",
+  "github_id": "TODO",
+  "name": "Fork-and-Merge Training with Linearized Branch",
+  "blurb": "Fork-merge training loop: every 3N steps, run one normal DDP branch to θ₁, then a second branch from θ₀ following the 2nd-order Taylor surrogate of the loss around θ₁ (HVP via torch.func.jvp), and average. Research experiment, not a record attempt.",
+  "date": "2026-04-22",
+  "track": "10min_16mb",
+  "entrypoint": "train_gpt_forked.py",
+  "seeds": [42],
+  "seed_results": {
+    "42": {"val_bpb": null, "artifact_bytes": null}
+  },
+  "val_bpb": null,
+  "hardware": "8xH100 80GB SXM"
+}
