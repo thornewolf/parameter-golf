@@ -55,6 +55,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.func import functional_call, grad, jvp
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Reuse the heavy lifting from the reference script.
@@ -171,7 +172,11 @@ def _loss_of_params(
     # Match the real-training forward's autocast: CastedLinear weights are
     # fp32 while embeddings / low-dim params are bf16, so without autocast
     # the matmul inside CastedLinear.forward sees mismatched dtypes.
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+    # Force SDPBackend.MATH — the flash / mem-efficient SDPA kernels don't
+    # implement forward-mode AD, which jvp requires.
+    with sdpa_kernel(SDPBackend.MATH), torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=True
+    ):
         return functional_call(
             model, {**params, **buffers}, args=(x, y, block_mask)
         )
