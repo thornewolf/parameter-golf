@@ -54,7 +54,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.func import functional_call, jvp
+from torch.func import functional_call, grad, jvp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Reuse the heavy lifting from the reference script.
@@ -195,25 +195,20 @@ def linearized_loss_and_grad(
     branch-2's trajectory actually differ from a naive SGD on θ₁'s loss.
 
     We compute g₁ + H₁·Δ in one shot using torch.func.jvp applied to the
-    gradient function: jvp(grad_fn, (θ₁,), (Δ,)) returns (grad_fn(θ₁),
-    ∂_ε grad_fn(θ₁+εΔ)|_{ε=0}) = (g₁, H₁·Δ). That's forward-over-reverse autodiff,
-    the standard efficient HVP recipe.
+    functorch grad of the loss: jvp(grad(loss_fn), (θ₁,), (Δ,)) returns
+    (grad(loss_fn)(θ₁), ∂_ε grad(loss_fn)(θ₁+εΔ)|_{ε=0}) = (g₁, H₁·Δ). That's
+    forward-over-reverse autodiff — the standard efficient HVP recipe, and the
+    functorch form is required (plain torch.autograd.grad with
+    requires_grad_() is not allowed inside a jvp transform).
     """
     delta = {name: theta2[name] - theta1[name] for name in theta1}
 
-    def grad_fn(params: dict[str, Tensor]) -> dict[str, Tensor]:
-        # Inner reverse mode. Return ∇_θ L(θ) for the given θ.
-        params_req = {k: v.detach().requires_grad_(True) for k, v in params.items()}
-        loss = _loss_of_params(model, params_req, buffers, x, y, block_mask)
-        grads = torch.autograd.grad(
-            loss,
-            list(params_req.values()),
-            create_graph=True,  # needed so the outer jvp can differentiate through
-        )
-        return dict(zip(params_req.keys(), grads))
+    def loss_fn(params: dict[str, Tensor]) -> Tensor:
+        return _loss_of_params(model, params, buffers, x, y, block_mask)
 
-    g1, Hdelta = jvp(grad_fn, (theta1,), (delta,))
-    grad = {name: g1[name] + Hdelta[name] for name in g1}
+    grad_of_loss = grad(loss_fn)
+    g1, Hdelta = jvp(grad_of_loss, (theta1,), (delta,))
+    out_grad = {name: g1[name] + Hdelta[name] for name in g1}
 
     # Also compute the surrogate value itself for logging.
     with torch.no_grad():
@@ -222,7 +217,7 @@ def linearized_loss_and_grad(
         quadratic_term = 0.5 * sum((Hdelta[n] * delta[n]).sum() for n in Hdelta)
         surrogate_loss = loss_at_theta1 + linear_term + quadratic_term
 
-    return surrogate_loss.detach(), grad
+    return surrogate_loss.detach(), out_grad
 
 
 # -----------------------------
