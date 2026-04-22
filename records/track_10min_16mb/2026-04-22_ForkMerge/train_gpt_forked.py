@@ -169,21 +169,16 @@ def _loss_of_params(
     block_mask,
 ) -> Tensor:
     # Functional view: loss as a pure function of the parameter dict.
-    #
-    # CastedLinear keeps its weight in fp32 and casts to x.dtype at matmul
-    # time. Real training uses torch.autocast to unify dtypes to bf16; but
-    # autocast's saved-tensor hooks don't compose reliably with functorch,
-    # so the backward under grad() ends up with bf16/fp32 mismatches.
-    # Instead, cast every param to bf16 inline before functional_call.
-    # jvp differentiates through .to(bf16) cleanly — the gradient returned
-    # by grad(loss_fn) will be in the caller's original param dtypes.
-    #
-    # SDPBackend.MATH is also required: flash / mem-efficient SDPA kernels
-    # don't implement forward-mode AD, which jvp needs.
-    params_bf16 = {k: v.to(torch.bfloat16) for k, v in params.items()}
+    # Callers are expected to pass params/buffers already cast to a single
+    # dtype (bf16) so CastedLinear's `.to(x.dtype)` inside the model is a
+    # no-op and no cross-dtype matmul ever happens. Doing the cast here
+    # would put a `.to(bf16)` inside the jvp transform, which functorch's
+    # dual-tensor plumbing handles unreliably (produces spurious fp32/bf16
+    # mismatches). SDPBackend.MATH is still required because flash and
+    # mem-efficient SDPA don't implement forward-mode AD.
     with sdpa_kernel(SDPBackend.MATH):
         return functional_call(
-            model, {**params_bf16, **buffers}, args=(x, y, block_mask)
+            model, {**params, **buffers}, args=(x, y, block_mask)
         )
 
 
@@ -215,20 +210,39 @@ def linearized_loss_and_grad(
     functorch form is required (plain torch.autograd.grad with
     requires_grad_() is not allowed inside a jvp transform).
     """
-    delta = {name: theta2[name] - theta1[name] for name in theta1}
+    # Cast theta1, delta, and floating buffers to bf16 *outside* the jvp
+    # transform. CastedLinear's `.to(x.dtype)` becomes a no-op, so we never
+    # cross dtypes inside a dual-tensor operation (which is where functorch
+    # trips up). We cast the resulting gradient back to the caller's
+    # original param dtypes so the optimizer sees the dtypes it expects.
+    orig_dtypes = {name: t.dtype for name, t in theta1.items()}
+    theta1_bf16 = {k: v.to(torch.bfloat16) for k, v in theta1.items()}
+    delta_bf16 = {
+        k: (theta2[k] - theta1[k]).to(torch.bfloat16) for k in theta1
+    }
+    buffers_cast = {
+        k: (b.to(torch.bfloat16) if b.is_floating_point() else b)
+        for k, b in buffers.items()
+    }
 
     def loss_fn(params: dict[str, Tensor]) -> Tensor:
-        return _loss_of_params(model, params, buffers, x, y, block_mask)
+        return _loss_of_params(model, params, buffers_cast, x, y, block_mask)
 
     grad_of_loss = grad(loss_fn)
-    g1, Hdelta = jvp(grad_of_loss, (theta1,), (delta,))
-    out_grad = {name: g1[name] + Hdelta[name] for name in g1}
+    g1, Hdelta = jvp(grad_of_loss, (theta1_bf16,), (delta_bf16,))
+    out_grad = {
+        name: (g1[name] + Hdelta[name]).to(orig_dtypes[name]) for name in g1
+    }
 
     # Also compute the surrogate value itself for logging.
     with torch.no_grad():
-        loss_at_theta1 = _loss_of_params(model, theta1, buffers, x, y, block_mask)
-        linear_term = sum((g1[n] * delta[n]).sum() for n in g1)
-        quadratic_term = 0.5 * sum((Hdelta[n] * delta[n]).sum() for n in Hdelta)
+        loss_at_theta1 = _loss_of_params(
+            model, theta1_bf16, buffers_cast, x, y, block_mask
+        )
+        linear_term = sum((g1[n] * delta_bf16[n]).sum() for n in g1)
+        quadratic_term = 0.5 * sum(
+            (Hdelta[n] * delta_bf16[n]).sum() for n in Hdelta
+        )
         surrogate_loss = loss_at_theta1 + linear_term + quadratic_term
 
     return surrogate_loss.detach(), out_grad
