@@ -169,16 +169,21 @@ def _loss_of_params(
     block_mask,
 ) -> Tensor:
     # Functional view: loss as a pure function of the parameter dict.
-    # Match the real-training forward's autocast: CastedLinear weights are
-    # fp32 while embeddings / low-dim params are bf16, so without autocast
-    # the matmul inside CastedLinear.forward sees mismatched dtypes.
-    # Force SDPBackend.MATH — the flash / mem-efficient SDPA kernels don't
-    # implement forward-mode AD, which jvp requires.
-    with sdpa_kernel(SDPBackend.MATH), torch.autocast(
-        device_type="cuda", dtype=torch.bfloat16, enabled=True
-    ):
+    #
+    # CastedLinear keeps its weight in fp32 and casts to x.dtype at matmul
+    # time. Real training uses torch.autocast to unify dtypes to bf16; but
+    # autocast's saved-tensor hooks don't compose reliably with functorch,
+    # so the backward under grad() ends up with bf16/fp32 mismatches.
+    # Instead, cast every param to bf16 inline before functional_call.
+    # jvp differentiates through .to(bf16) cleanly — the gradient returned
+    # by grad(loss_fn) will be in the caller's original param dtypes.
+    #
+    # SDPBackend.MATH is also required: flash / mem-efficient SDPA kernels
+    # don't implement forward-mode AD, which jvp needs.
+    params_bf16 = {k: v.to(torch.bfloat16) for k, v in params.items()}
+    with sdpa_kernel(SDPBackend.MATH):
         return functional_call(
-            model, {**params, **buffers}, args=(x, y, block_mask)
+            model, {**params_bf16, **buffers}, args=(x, y, block_mask)
         )
 
 
