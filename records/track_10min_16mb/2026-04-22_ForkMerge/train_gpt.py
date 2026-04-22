@@ -33,6 +33,14 @@ from torch.nn.attention.flex_attention import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Compile flex_attention once at import time so phase A/B (and the baseline
+# when FORK_ENABLED=0) get a fused flash-style kernel instead of the
+# warn-and-materialize unfused path. Phase C in train_gpt_forked.py forces
+# block_mask=None, which routes through F.scaled_dot_product_attention and
+# never touches this compiled path — so the compile is safe for the
+# jvp+functional_call flow that otherwise hates torch.compile.
+_compiled_flex_attention = torch.compile(flex_attention)
+
 
 def build_doc_block_mask(
     is_boundary_token_lut: Tensor,
@@ -768,8 +776,10 @@ class CausalSelfAttention(nn.Module):
             )
         else:
             # FlexAttention consumes the BlockMask (causal ∧ same-doc) directly and
-            # retains flash-style performance even with the custom mask.
-            y = flex_attention(
+            # retains flash-style performance even with the custom mask. Use the
+            # torch.compile'd version so we get a fused kernel instead of the
+            # warn-and-materialize unfused fallback.
+            y = _compiled_flex_attention(
                 q,
                 k,
                 v,

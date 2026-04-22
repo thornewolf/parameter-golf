@@ -549,11 +549,20 @@ def main() -> None:
         return total_loss / grad_accum_steps, drift
 
     # -------- Phase drivers. --------
+    # Timing notes:
+    #  * torch.cuda.synchronize() before each timestamp so GPU/CPU aren't
+    #    out of sync — otherwise Python returns while the kernel is still
+    #    running and "step_ms" is meaningless.
+    #  * Sync only at log boundaries; syncing every step slows things down.
     def run_phase_real(
         n_steps: int, loader: DistributedTokenLoader,
         opts: list[torch.optim.Optimizer], tag: str,
     ) -> None:
         base_model.train()
+        torch.cuda.synchronize()
+        phase_t0 = time.perf_counter()
+        window_t0 = phase_t0
+        window_start_step = 0
         for s in range(n_steps):
             for opt in opts:
                 opt.zero_grad(set_to_none=True)
@@ -565,7 +574,28 @@ def main() -> None:
             for opt in opts:
                 opt.step()
             if (s + 1) % max(args.train_log_every, 1) == 0 or s == 0:
-                log(f"[{tag}] step:{s + 1}/{n_steps} loss:{loss.item():.4f}")
+                torch.cuda.synchronize()
+                now = time.perf_counter()
+                window_steps = (s + 1) - window_start_step
+                step_ms = (now - window_t0) * 1000.0 / max(window_steps, 1)
+                tok_per_s = (
+                    args.train_batch_tokens * window_steps / (now - window_t0)
+                    if now > window_t0 else 0.0
+                )
+                log(
+                    f"[{tag}] step:{s + 1}/{n_steps} loss:{loss.item():.4f} "
+                    f"step_ms:{step_ms:.1f} tok/s:{tok_per_s:,.0f}"
+                )
+                window_t0 = now
+                window_start_step = s + 1
+        torch.cuda.synchronize()
+        phase_elapsed = time.perf_counter() - phase_t0
+        avg_ms = phase_elapsed * 1000.0 / max(n_steps, 1)
+        phase_tok_per_s = args.train_batch_tokens * n_steps / max(phase_elapsed, 1e-9)
+        log(
+            f"[{tag}] phase_done n_steps:{n_steps} total_s:{phase_elapsed:.1f} "
+            f"step_avg_ms:{avg_ms:.1f} tok/s:{phase_tok_per_s:,.0f}"
+        )
 
     def run_phase_linearized(
         n_steps: int, theta1: dict[str, Tensor],
@@ -573,6 +603,10 @@ def main() -> None:
     ) -> None:
         opt = make_optimizer_branch2_adam(base_model, args)
         base_model.train()
+        torch.cuda.synchronize()
+        phase_t0 = time.perf_counter()
+        window_t0 = phase_t0
+        window_start_step = 0
         for s in range(n_steps):
             opt.zero_grad(set_to_none=True)
             surrogate_loss, drift = train_step_linearized(theta1, loader)
@@ -582,10 +616,29 @@ def main() -> None:
                 )
             opt.step()
             if ((s + 1) % max(args.fork_diag_every, 1) == 0) or s == 0:
+                torch.cuda.synchronize()
+                now = time.perf_counter()
+                window_steps = (s + 1) - window_start_step
+                step_ms = (now - window_t0) * 1000.0 / max(window_steps, 1)
+                tok_per_s = (
+                    args.train_batch_tokens * window_steps / (now - window_t0)
+                    if now > window_t0 else 0.0
+                )
                 log(
                     f"[branch2-lin] step:{s + 1}/{n_steps} "
-                    f"surrogate_loss:{surrogate_loss.item():.4f} drift:{drift:.4f}"
+                    f"surrogate_loss:{surrogate_loss.item():.4f} drift:{drift:.4f} "
+                    f"step_ms:{step_ms:.1f} tok/s:{tok_per_s:,.0f}"
                 )
+                window_t0 = now
+                window_start_step = s + 1
+        torch.cuda.synchronize()
+        phase_elapsed = time.perf_counter() - phase_t0
+        avg_ms = phase_elapsed * 1000.0 / max(n_steps, 1)
+        phase_tok_per_s = args.train_batch_tokens * n_steps / max(phase_elapsed, 1e-9)
+        log(
+            f"[branch2-lin] phase_done n_steps:{n_steps} total_s:{phase_elapsed:.1f} "
+            f"step_avg_ms:{avg_ms:.1f} tok/s:{phase_tok_per_s:,.0f}"
+        )
 
     # -------- Main loop: (optional warmup of plain phase A) then A,(B,C,D),… --------
     # While-loop form so the per-iter cost (N vs 3N) can depend on whether
@@ -614,8 +667,11 @@ def main() -> None:
         fork_active = (
             args.fork_enabled and global_step >= args.fork_warmup_steps
         )
+        cycle_t0 = time.perf_counter()
+        run_elapsed = cycle_t0 - t0
         log(
-            f"=== cycle {cycle} (step {global_step}, fork_active={fork_active}) ==="
+            f"=== cycle {cycle} (step {global_step}/{args.iterations}, "
+            f"fork_active={fork_active}, run_elapsed:{run_elapsed:.1f}s) ==="
         )
 
         # Phase A: normal training on single model.
@@ -624,7 +680,12 @@ def main() -> None:
 
         if not fork_active:
             val_loss, val_bpb = run_eval_val()
-            log(f"step:{global_step} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
+            cycle_elapsed = time.perf_counter() - cycle_t0
+            log(
+                f"[cycle {cycle}] warmup step:{global_step} "
+                f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"cycle_s:{cycle_elapsed:.1f}"
+            )
             continue
 
         # Snapshot θ₀ (identical on all ranks since DDP kept params in sync).
@@ -659,9 +720,11 @@ def main() -> None:
 
         val_loss, val_bpb = run_eval_val()
         elapsed = time.perf_counter() - t0
+        cycle_elapsed = time.perf_counter() - cycle_t0
         log(
-            f"[merged] step:{global_step} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-            f"elapsed:{elapsed:.1f}s"
+            f"[cycle {cycle}] merged step:{global_step} "
+            f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+            f"cycle_s:{cycle_elapsed:.1f} run_elapsed:{elapsed:.1f}s"
         )
 
     # Final eval
