@@ -123,6 +123,21 @@ def average_param_dicts(
     return {k: 0.5 * (a[k] + b[k]) for k in a}
 
 
+def reset_rope_caches(model: nn.Module) -> None:
+    # `eval_val` runs under torch.inference_mode(), which means any Rotary cos/sin
+    # tables built *during* that call are stored as inference tensors and can't
+    # later be saved for backward. If we call eval_val before any training has
+    # warmed the cache, the first training forward blows up with
+    # "Inference tensors cannot be saved for backward". Invalidate any stored
+    # tables so the next Rotary.forward rebuilds them in a normal autograd
+    # context. Duck-typed so we don't have to import the Rotary class.
+    for m in model.modules():
+        if hasattr(m, "_cos_cached") and hasattr(m, "_sin_cached"):
+            m._cos_cached = None
+            m._sin_cached = None
+            m._seq_len_cached = 0
+
+
 def broadcast_params_from_rank0(model: nn.Module) -> None:
     """After the merge, make sure every rank has bit-identical params.
 
@@ -518,6 +533,7 @@ def main() -> None:
     # Initial val
     val_loss, val_bpb = run_eval_val()
     log(f"step:0 val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
+    reset_rope_caches(base_model)
 
     t0 = time.perf_counter()
     global_step = 0
