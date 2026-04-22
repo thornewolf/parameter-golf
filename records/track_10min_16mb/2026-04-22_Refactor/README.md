@@ -4,16 +4,16 @@ Refactor of `train_gpt.py`. Default hyperparameters match the Naive Baseline
 (VOCAB_SIZE=1024, 9L x 512d, 8H / 4KV, MLP 2x, tied embeddings). No ML changes
 intended — the submission is about code clarity / structure.
 
-## Results (3 seeds, 8xH100 SXM)
+## Results (seed 42, 8xH100 SXM)
 
-<!-- TODO: fill in after the RunPod runs complete -->
+<!-- TODO: fill in after the RunPod run completes -->
 
 | Seed | val_loss | val_bpb | artifact_bytes |
 |------|----------|---------|----------------|
 | 42   |          |         |                |
-| 314  |          |         |                |
-| 999  |          |         |                |
-| **Mean** |      |         |                |
+
+Single-seed run. Not a statistically-significant record claim; intended as a
+refactor/readability submission rather than a new leaderboard entry.
 
 ## Command
 
@@ -36,5 +36,3 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - `submission.json`
 - `train_gpt.py`
 - `train_seed42.log`
-- `train_seed314.log`
-- `train_seed999.log`
