@@ -168,9 +168,13 @@ def _loss_of_params(
     block_mask,
 ) -> Tensor:
     # Functional view: loss as a pure function of the parameter dict.
-    return functional_call(
-        model, {**params, **buffers}, args=(x, y, block_mask)
-    )
+    # Match the real-training forward's autocast: CastedLinear weights are
+    # fp32 while embeddings / low-dim params are bf16, so without autocast
+    # the matmul inside CastedLinear.forward sees mismatched dtypes.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+        return functional_call(
+            model, {**params, **buffers}, args=(x, y, block_mask)
+        )
 
 
 def linearized_loss_and_grad(
