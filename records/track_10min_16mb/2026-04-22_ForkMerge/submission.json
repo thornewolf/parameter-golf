@@ -1,15 +1,26 @@
 {
-  "author": "TODO",
-  "github_id": "TODO",
-  "name": "Fork-and-Merge Training with Linearized Branch",
-  "blurb": "Fork-merge training loop: every 3N steps, run one normal DDP branch to θ₁, then a second branch from θ₀ following the 2nd-order Taylor surrogate of the loss around θ₁ (HVP via torch.func.jvp), and average. Research experiment, not a record attempt.",
+  "author": "thornewolf",
+  "github_id": "thornewolf",
+  "name": "Fork-and-Merge Training with Linearized Branch (Late-training SWA)",
+  "blurb": "Designed: periodic fork into two branches, one trained normally and one against a 2nd-order Taylor surrogate of the loss around the first, merged by averaging. Found: at the only branch-2 LR that keeps phase C stable, branch-2 barely moves, so the merge reduces to plain SWA between fork-start and fork-end checkpoints. 0.020-nat improvement over baseline at matched compute is real but driven by weight averaging, not by the curvature-aware surrogate. Non-record, research/negative-result submission.",
   "date": "2026-04-22",
   "track": "10min_16mb",
   "entrypoint": "train_gpt_forked.py",
   "seeds": [42],
-  "seed_results": {
-    "42": {"val_bpb": null, "artifact_bytes": null}
+  "comparison": {
+    "baseline10k_seq1024": {"val_bpb": 1.3172, "val_loss": 2.2240},
+    "fork10k_seq1024_lr1e4_UNSTABLE": {"val_bpb": 2.3631, "val_loss": 3.9900, "note": "drift exploded to 721, merge destroyed model"},
+    "fork10k_seq1024_lr1e5": {"val_bpb": 1.2973, "val_loss": 2.1904, "delta_vs_baseline": -0.0199}
   },
-  "val_bpb": null,
-  "hardware": "8xH100 80GB SXM"
+  "config_winner": {
+    "iterations": 10000,
+    "train_batch_tokens": 131072,
+    "train_seq_len": 1024,
+    "fork_phase_steps": 833,
+    "fork_warmup_steps": 7500,
+    "fork_branch2_lr": 1e-5
+  },
+  "hardware": "8xH100 80GB SXM",
+  "is_record": false,
+  "note": "Compared to published Naive Baseline (val_bpb 1.2244 at batch 524288, post-quant): not competitive. Pre-quant measurement at 4x smaller batch."
 }
