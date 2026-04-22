@@ -448,9 +448,13 @@ def main() -> None:
             x, y = loader.next_batch(
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
-            block_mask = build_doc_block_mask(
-                is_boundary_token_lut, x, args.doc_attn_gate
-            )
+            # flex_attention runs through torch._dynamo and trips internal
+            # meta-tensor assertions when composed with torch.func.jvp. Force
+            # the block_mask=None branch so the attention module uses plain
+            # SDPA (which composes fine with functorch). The semantic cost is
+            # that phase C loses the document-boundary attention mask — ok for
+            # this experiment, since the fork-merge behavior is the point.
+            block_mask = None
             surrogate_loss, surrogate_grad = linearized_loss_and_grad(
                 base_model, theta1, current_theta2, current_buffers,
                 x, y, block_mask,
