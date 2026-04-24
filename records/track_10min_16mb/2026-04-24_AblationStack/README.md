@@ -14,6 +14,8 @@ top stack when enabled one development at a time?
   leaderboard trainer from `2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT`.
 - `ablations.csv` -- planned runs, boolean feature columns, and exact env
   overrides.
+- `run_with_ntfy.sh` -- command wrapper that tees logs and sends ntfy start and
+  completion notifications.
 - `submission.json` -- metadata placeholder for this non-record research entry.
 
 ## Techniques Mined From The Leaderboard
@@ -83,6 +85,22 @@ TTT_EPOCHS=3 \
 torchrun --standalone --nproc_per_node=8 \
   records/track_10min_16mb/2026-04-24_AblationStack/train_gpt_common_stack.py
 ```
+
+With ntfy notifications:
+
+```bash
+export NTFY_TOPIC=thornewolf
+export LOG_DIR=logs/ablation_runs
+
+records/track_10min_16mb/2026-04-24_AblationStack/run_with_ntfy.sh \
+  --run-id A130_full_ttt_seed42 \
+  --config A130_full_ttt \
+  -- bash -lc 'DATA_DIR=./data RUN_ID=A130_full_ttt_seed42 SEED=42 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 torchrun --standalone --nproc_per_node=8 records/track_10min_16mb/2026-04-24_AblationStack/train_gpt_common_stack.py'
+```
+
+The wrapper sends a start notification, tees stdout/stderr to a log, then
+publishes a JSON ntfy payload with exit code, elapsed time, git SHA, log path,
+and the final metric lines.
 
 ## Execution Plan
 

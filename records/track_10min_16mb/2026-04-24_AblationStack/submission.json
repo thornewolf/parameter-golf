@@ -18,6 +18,7 @@
     "README.md",
     "submission.json",
     "ablations.csv",
+    "run_with_ntfy.sh",
     "train_gpt_baseline.py",
     "train_gpt_common_stack.py"
   ],
