@@ -43,7 +43,7 @@ by the matrix:
 
 ```bash
 cd /workspace
-git clone https://github.com/openai/parameter-golf.git
+git clone https://github.com/thornewolf/parameter-golf.git
 cd parameter-golf
 git checkout codex/2026-04-24-ablation-stack
 
