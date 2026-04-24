@@ -1,0 +1,38 @@
+{
+  "author": "thornewolf",
+  "github_id": "thornewolf",
+  "name": "Baseline Clone + Leaderboard Stack Ablation Plan",
+  "blurb": "Non-record research entry containing a byte-for-byte baseline clone, a readable common-stack trainer derived from the current leaderboard SOTA, and an ablation matrix for progressively enabling recurring techniques from baseline toward SOTA.",
+  "date": "2026-04-24",
+  "track": "10min_16mb",
+  "entrypoints": {
+    "baseline": "train_gpt_baseline.py",
+    "common_stack": "train_gpt_common_stack.py"
+  },
+  "status": "planned",
+  "is_record": false,
+  "seeds": [42, 314, 999],
+  "val_bpb": null,
+  "hardware": "8xH100 80GB SXM",
+  "included_files": [
+    "README.md",
+    "submission.json",
+    "ablations.csv",
+    "train_gpt_baseline.py",
+    "train_gpt_common_stack.py"
+  ],
+  "technique_factors": [
+    "SP4096/SP8192 tokenizer",
+    "11L 512d model shape",
+    "4x MLP",
+    "XSA",
+    "MuonEq-R with high weight decay",
+    "EMA",
+    "depth recurrence",
+    "parallel residuals",
+    "QK-Gain 5.25",
+    "GPTQ SDClip int6/int8 export",
+    "sliding-window eval",
+    "legal score-first TTT"
+  ]
+}
